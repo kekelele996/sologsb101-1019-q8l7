@@ -135,6 +135,12 @@ body::before {
   border-top: 2px dashed var(--gb-ochre);
 }
 
+/* 被专家委员会批复级别挡回的工序（未完成、不许做） */
+.gb-step-row.is-blocked {
+  border-color: rgba(176, 58, 46, 0.45);
+  background: rgba(176, 58, 46, 0.06);
+}
+
 .gb-drag-handle {
   cursor: grab;
   color: rgba(47, 42, 36, 0.42);

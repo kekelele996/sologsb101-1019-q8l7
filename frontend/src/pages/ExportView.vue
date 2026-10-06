@@ -14,6 +14,7 @@ import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useApprovalStore } from '@/stores/approvalStore'
 import {
   BINDING_METHOD_OPTIONS,
   BINDING_VERDICT_COLOR,
@@ -24,6 +25,7 @@ import {
   type BindingDraft,
   type BindingVerdict
 } from '@/types/binding'
+import type { RepairApproval } from '@/types/approval'
 import { BINDING_TYPE_LABEL, VOLUME_STATE_LABEL, isVolumeLocked } from '@/types/volume'
 import type { Paper } from '@/types/paper'
 import {
@@ -44,13 +46,16 @@ import {
   exportLeafLedgerCsv,
   exportSnapshotJson
 } from '@/utils/export'
+import { effectiveApproval } from '@/utils/approval'
 
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const approvalStore = useApprovalStore()
 const { totals } = useLeafStats()
 const bindingTable = useIdbTable<Binding>((database) => database.bindings, { sortByUpdatedAt: false })
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
+const approvalTable = useIdbTable<RepairApproval>((database) => database.approvals, { sortByUpdatedAt: false })
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const lastBackupAt = ref<string | null>(readLastBackupAt())
@@ -77,13 +82,17 @@ const stat = computed(() => {
   const pass = list.filter((item) => item.verdict === 'pass').length
   const archived = bookStore.volumes.filter((volume) => volume.state === 'archived').length
   const pendingBinding = bookStore.volumes.filter((volume) => !isVolumeLocked(volume.state)).length
+  const approvedVolumes = bookStore.volumes.filter(
+    (volume) => effectiveApproval(approvalTable.rows.value.filter((item) => item.volumeId === volume.id)) !== null
+  ).length
   return {
     total: list.length,
     pass,
     rework: list.length - pass,
     passPercent: list.length === 0 ? 0 : Math.round((pass / list.length) * 100),
     archived,
-    pendingBinding
+    pendingBinding,
+    approvedVolumes
   }
 })
 
@@ -93,7 +102,8 @@ const context = computed(() => ({
   leaves: leafStore.leaves,
   papers: paperTable.rows.value,
   repairOrders: repairStore.orders,
-  bindings: bindingTable.rows.value
+  bindings: bindingTable.rows.value,
+  approvals: approvalTable.rows.value
 }))
 
 const archiveText = computed(() => buildArchiveReport(context.value))
@@ -208,7 +218,13 @@ async function handleFile(event: Event): Promise<void> {
     return
   }
   await importSnapshot(parsed as RestoreSnapshot)
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    approvalStore.loadApprovals()
+  ])
   ElMessage.success('导入完成，数据已覆盖')
 }
 
@@ -223,7 +239,13 @@ async function handleReset(): Promise<void> {
     return
   }
   await resetDatabase()
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    approvalStore.loadApprovals()
+  ])
   ElMessage.success('已清空并重新载入演示数据')
 }
 
@@ -264,6 +286,7 @@ function verdictColor(verdict: string): string {
       <StatBadge label="装订记录" :value="stat.total" suffix="条" tone="primary" />
       <StatBadge label="验收合格率" :value="`${stat.passPercent}%`" :percent="stat.passPercent" tone="success" />
       <StatBadge label="返修" :value="stat.rework" suffix="条" tone="danger" />
+      <StatBadge label="已批复册次" :value="stat.approvedVolumes" suffix="册" tone="info" />
       <StatBadge label="已归档册次" :value="stat.archived" suffix="册" tone="info" />
       <StatBadge label="待装订册次" :value="stat.pendingBinding" suffix="册" tone="warning" />
       <StatBadge label="工序完成率" :value="`${totals.orderPercent}%`" :percent="totals.orderPercent" />
@@ -328,7 +351,7 @@ function verdictColor(verdict: string): string {
         <el-card shadow="never" style="margin-top: 16px">
           <template #header>整库导出</template>
           <p class="gb-muted">
-            导出文件包含 6 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
+            导出文件包含 7 张业务表全量数据（含专家委员会方案批复）与结构版本号，可在其他设备通过「导入 JSON」还原。
           </p>
           <div class="gb-toolbar">
             <el-button :icon="Download" @click="handleExport">JSON 备份</el-button>

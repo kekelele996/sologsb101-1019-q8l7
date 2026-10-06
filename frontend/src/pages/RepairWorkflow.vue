@@ -15,7 +15,14 @@ import { useIdbTable } from '@/hooks/useIdbTable'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useApprovalStore } from '@/stores/approvalStore'
 import { DAMAGE_TYPE_LABEL } from '@/types/leaf'
+import {
+  APPROVAL_LEVEL_COLOR,
+  APPROVAL_LEVEL_LABEL,
+  isOrderAllowedByLevel,
+  type ApprovalLevel
+} from '@/types/approval'
 import {
   ORDER_STATE_COLOR,
   ORDER_STATE_LABEL,
@@ -33,6 +40,7 @@ import { PAPER_TYPE_LABEL, type Paper } from '@/types/paper'
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const approvalStore = useApprovalStore()
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
 
 const FILTER_KEYS = ['name', 'state'] as const
@@ -66,6 +74,13 @@ const currentLeaf = computed(() => (currentLeafId.value ? leafStore.leafById(cur
 const currentPaper = computed(() =>
   currentLeafId.value ? paperTable.rows.value.find((paper) => paper.leafId === currentLeafId.value) : undefined
 )
+
+/** 当前书叶所属册次的生效批复（委员会侧各记各的，这里只读对账） */
+const currentVolumeId = computed(() => (currentLeaf.value ? currentLeaf.value.volumeId : ''))
+const effectiveApprovalRow = computed(() =>
+  currentVolumeId.value ? approvalStore.effectiveOfVolume(currentVolumeId.value) : null
+)
+const currentLevel = computed<ApprovalLevel | null>(() => effectiveApprovalRow.value?.level ?? null)
 
 const filterModel = computed<FilterModel>(() => ({
   keyword: url.keyword.value,
@@ -110,6 +125,7 @@ const stat = computed(() => {
     done,
     doing: list.filter((order) => order.state === 'doing').length,
     todo: list.filter((order) => order.state === 'todo').length,
+    blocked: list.filter((order) => repairStore.isBlocked(order)).length,
     percent: list.length === 0 ? 0 : Math.round((done / list.length) * 100)
   }
 })
@@ -130,13 +146,26 @@ const selectedIds = ref<string[]>([])
 const dragId = ref('')
 const overId = ref('')
 
+const formNameOptions = computed(() =>
+  REPAIR_NAME_OPTIONS.map((item) => ({
+    ...item,
+    disabled: !isOrderAllowedByLevel(currentLevel.value, item.value)
+  }))
+)
+
 function openCreate(): void {
   if (!currentLeafId.value) {
     ElMessage.warning('请先选择书叶')
     return
   }
+  if (!currentLevel.value) {
+    ElMessage.warning('该册还没有生效的方案批复，动手前请先把方案报专家委员会批复')
+    return
+  }
   editing.value = null
   Object.assign(form, createEmptyOrderDraft(currentLeafId.value, repairStore.nextSeq(currentLeafId.value)))
+  // 新建默认补破（各档都允许）；编辑时工序名若被级别挡住，选项会标红但已完成工序不回退
+  form.name = 'mend'
   dialog.value = true
 }
 
@@ -164,14 +193,18 @@ watch(
 )
 
 async function submit(): Promise<void> {
-  if (editing.value) {
-    await repairStore.updateOrder(editing.value.id, { ...form })
-    ElMessage.success('已更新工序')
-  } else {
-    await repairStore.createOrder({ ...form })
-    ElMessage.success(`已新增第 ${form.seq} 道工序`)
+  try {
+    if (editing.value) {
+      await repairStore.updateOrder(editing.value.id, { ...form })
+      ElMessage.success('已更新工序')
+    } else {
+      await repairStore.createOrder({ ...form })
+      ElMessage.success(`已新增第 ${form.seq} 道工序`)
+    }
+    dialog.value = false
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '保存失败')
   }
-  dialog.value = false
 }
 
 async function remove(order: RepairOrder): Promise<void> {
@@ -195,8 +228,12 @@ async function advance(order: RepairOrder): Promise<void> {
     ElMessage.warning(`第 ${previous.seq} 道「${REPAIR_NAME_LABEL[previous.name]}」尚未完成，禁止推进`)
     return
   }
-  const next = await repairStore.advanceOrder(order.id)
-  ElMessage.success(`已置为「${ORDER_STATE_LABEL[next]}」${next === 'done' ? '，并回写书叶状态' : ''}`)
+  try {
+    const next = await repairStore.advanceOrder(order.id)
+    ElMessage.success(`已置为「${ORDER_STATE_LABEL[next]}」${next === 'done' ? '，并回写书叶状态' : ''}`)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '推进失败')
+  }
 }
 
 async function generate(): Promise<void> {
@@ -204,11 +241,20 @@ async function generate(): Promise<void> {
     ElMessage.warning('请先选择书叶')
     return
   }
-  const created = await repairStore.generateSequence(currentLeafId.value)
-  if (created === 0) {
-    ElMessage.info('该叶已有完整工序序列')
-  } else {
-    ElMessage.success(`已生成 ${created} 道标准工序（补破 → 托裱 → 溜口 → 裁齐 → 压平）`)
+  try {
+    const { created, skipped } = await repairStore.generateSequence(currentLeafId.value)
+    if (created === 0 && skipped > 0) {
+      ElMessage.warning('加固档只准补破、溜口；标准序列里的托裱、裁齐、压平已按批复挡回')
+    } else if (created === 0) {
+      ElMessage.info('该叶已有完整工序序列')
+    } else {
+      ElMessage.success(
+        `已生成 ${created} 道工序（补破 → 托裱 → 溜口 → 裁齐 → 压平）` +
+          (skipped > 0 ? `；${skipped} 道超出当前批复级别，已挡回` : '')
+      )
+    }
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '生成失败')
   }
 }
 
@@ -217,8 +263,12 @@ async function batchComplete(): Promise<void> {
     ElMessage.warning('请先勾选工序')
     return
   }
-  await repairStore.batchUpdate(selectedIds.value, { state: 'done' })
-  ElMessage.success(`已批量完成 ${selectedIds.value.length} 道工序`)
+  const applied = await repairStore.batchUpdate(selectedIds.value, { state: 'done' })
+  if (applied < selectedIds.value.length) {
+    ElMessage.warning(`已完成 ${applied} 道；${selectedIds.value.length - applied} 道不符合批复级别，已挡回`)
+  } else {
+    ElMessage.success(`已批量完成 ${applied} 道工序`)
+  }
   selectedIds.value = []
 }
 
@@ -251,6 +301,14 @@ function stateColor(state: string): string {
   return ORDER_STATE_COLOR[state as keyof typeof ORDER_STATE_COLOR] ?? '#8c8c8c'
 }
 
+function approvalLevelLabel(level: ApprovalLevel): string {
+  return APPROVAL_LEVEL_LABEL[level]
+}
+
+function approvalLevelColor(level: ApprovalLevel): string {
+  return APPROVAL_LEVEL_COLOR[level]
+}
+
 watchEffect(() => {
   // 保证筛选条件变化时列表自动重算（URL 为唯一事实来源）
   void url.keyword.value
@@ -269,10 +327,23 @@ watchEffect(() => {
         <el-select v-model="currentLeafId" filterable placeholder="选择书叶" style="width: 320px">
           <el-option v-for="item in leafOptions" :key="item.value" :label="item.label" :value="item.value" />
         </el-select>
-        <el-button :icon="Plus" @click="generate">生成标准序列</el-button>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增工序</el-button>
+        <el-button :icon="Plus" :disabled="!currentLevel" @click="generate">生成标准序列</el-button>
+        <el-button type="primary" :icon="Plus" :disabled="!currentLevel" @click="openCreate">新增工序</el-button>
       </div>
     </div>
+
+    <el-alert
+      v-if="!currentLevel"
+      type="warning"
+      show-icon
+      :closable="false"
+      style="margin-bottom: 12px"
+      title="该册还没有生效的方案批复，修复室只读：动手前先把方案报专家委员会"
+    >
+      <template #default>
+        <router-link to="/approvals" style="font-weight: 600">前往方案批复页登记 →</router-link>
+      </template>
+    </el-alert>
 
     <div class="gb-stat-row">
       <StatBadge label="工序总数" :value="stat.total" suffix="道" tone="primary" />
@@ -280,6 +351,7 @@ watchEffect(() => {
       <StatBadge label="已完成" :value="stat.done" suffix="道" tone="success" />
       <StatBadge label="进行中" :value="stat.doing" suffix="道" tone="warning" />
       <StatBadge label="未开始" :value="stat.todo" suffix="道" />
+      <StatBadge label="批复挡回" :value="stat.blocked" suffix="道" tone="danger" />
       <StatBadge label="全局完成率" :value="`${repairStore.donePercent}%`" :percent="repairStore.donePercent" tone="info" />
     </div>
 
@@ -288,6 +360,16 @@ watchEffect(() => {
         <span>当前书叶：第 {{ currentLeaf.leafNo }} 叶</span>
         <DamageTag :type="currentLeaf.damageType" :note="`${currentLeaf.damageAreaCm2} cm²`" />
         <el-tag effect="plain" round>pH {{ currentLeaf.phValue }}</el-tag>
+        <el-tag
+          v-if="currentLevel"
+          :style="{ color: approvalLevelColor(currentLevel), borderColor: `${approvalLevelColor(currentLevel)}66` }"
+          effect="plain"
+          round
+        >
+          批复级别：{{ approvalLevelLabel(currentLevel) }}
+          <span v-if="effectiveApprovalRow" class="gb-muted"> · {{ effectiveApprovalRow.planNo }}</span>
+        </el-tag>
+        <el-tag v-else type="danger" effect="plain" round>无有效批复（只读）</el-tag>
         <el-tag v-if="currentPaper" type="success" effect="plain" round>
           补纸：{{ PAPER_TYPE_LABEL[currentPaper.paperType] }} · ΔE {{ currentPaper.deltaE }}
         </el-tag>
@@ -330,7 +412,11 @@ watchEffect(() => {
           v-for="order in steps"
           :key="order.id"
           class="gb-step-row"
-          :class="{ 'is-dragging': dragId === order.id, 'is-over': overId === order.id && dragId !== order.id }"
+          :class="{
+            'is-dragging': dragId === order.id,
+            'is-over': overId === order.id && dragId !== order.id,
+            'is-blocked': repairStore.isBlocked(order)
+          }"
           @dragover.prevent="overId = order.id"
           @drop="drop(order.id)"
         >
@@ -339,6 +425,7 @@ watchEffect(() => {
           </el-icon>
           <el-checkbox
             :model-value="selectedIds.includes(order.id)"
+            :disabled="repairStore.isBlocked(order)"
             @update:model-value="() => toggleSelect(order.id)"
           />
           <el-tag effect="plain" round>第 {{ order.seq }} 道</el-tag>
@@ -346,10 +433,13 @@ watchEffect(() => {
           <el-tag :style="{ color: stateColor(order.state), borderColor: `${stateColor(order.state)}66` }" effect="plain" round>
             {{ stateLabel(order.state) }}
           </el-tag>
+          <el-tag v-if="repairStore.isBlocked(order)" type="danger" effect="dark" round>批复挡回</el-tag>
           <span class="gb-muted">{{ order.material || '未填材料' }}</span>
           <span class="gb-muted">{{ order.operator || '未填操作人' }} · {{ order.date }}</span>
           <div style="margin-left: auto; display: flex; gap: 4px">
-            <el-button size="small" text type="primary" @click="advance(order)">推进状态</el-button>
+            <el-button size="small" text type="primary" :disabled="repairStore.isBlocked(order)" @click="advance(order)">
+              推进状态
+            </el-button>
             <el-button size="small" text :icon="Edit" @click="openEdit(order)">编辑</el-button>
             <el-button size="small" text type="danger" :icon="Delete" @click="remove(order)">删除</el-button>
           </div>
@@ -369,12 +459,26 @@ watchEffect(() => {
 
     <el-dialog v-model="dialog" :title="editing ? `编辑第 ${editing.seq} 道工序` : '新增修复工序'" width="560px">
       <el-form label-width="100px">
+        <el-alert
+          v-if="editing && repairStore.isBlocked(editing)"
+          type="warning"
+          show-icon
+          :closable="false"
+          style="margin-bottom: 10px"
+          title="该工序超出当前批复级别，不能推进或改做其它未批准工序；已完成的工序不回退。"
+        />
         <el-form-item label="工序序号" required>
           <el-input-number v-model="form.seq" :min="1" :max="99" />
         </el-form-item>
         <el-form-item label="工序名" required>
           <el-select v-model="form.name" style="width: 100%">
-            <el-option v-for="item in REPAIR_NAME_OPTIONS" :key="item.value" :label="item.label" :value="item.value" />
+            <el-option
+              v-for="item in formNameOptions"
+              :key="item.value"
+              :label="`${item.label}${item.disabled ? '（批复级别不允许）' : ''}`"
+              :value="item.value"
+              :disabled="item.disabled"
+            />
           </el-select>
         </el-form-item>
         <el-form-item label="材料">

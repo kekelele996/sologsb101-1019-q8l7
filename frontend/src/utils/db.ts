@@ -1,7 +1,9 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Paper 增加 dyeRecipe 字段并按纸种回填默认配方）
- * - 六张业务表的增删改查与整库导入导出
+ * - 数据结构版本号与升级迁移逻辑
+ *   v1 → v2：Paper 增加 dyeRecipe 字段并按纸种回填默认配方
+ *   v2 → v3：新增 approvals（专家委员会方案批复）表，旧册次按整册进度回填历史批复
+ * - 七张业务表的增删改查与整库导入导出
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
@@ -12,12 +14,14 @@ import type { Leaf } from '@/types/leaf'
 import { DEFAULT_DYE_RECIPE, type Paper } from '@/types/paper'
 import type { RepairOrder } from '@/types/repairOrder'
 import type { Binding } from '@/types/binding'
+import type { ApprovalLevel, RepairApproval } from '@/types/approval'
+import { classifyLevelByProgress, historicalPlanNo } from './approval'
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbbookrestore'
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -88,6 +92,7 @@ export class BookRestoreDatabase extends Dexie {
   papers!: Table<Paper, string>
   repairOrders!: Table<RepairOrder, string>
   bindings!: Table<Binding, string>
+  approvals!: Table<RepairApproval, string>
 
   constructor() {
     super(DB_NAME)
@@ -101,7 +106,7 @@ export class BookRestoreDatabase extends Dexie {
       bindings: 'id, volumeId, verdict, finishDate, updatedAt'
     })
     // v2：Paper 增加 dyeRecipe 字段，按纸种为历史记录回填默认配方
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         books: 'id, title, era, level, collectionNo, updatedAt',
         volumes: 'id, bookId, volumeNo, bindingType, state, updatedAt',
@@ -121,6 +126,62 @@ export class BookRestoreDatabase extends Dexie {
             if (typeof paper.deltaE !== 'number') paper.deltaE = 2
             if (typeof paper.thicknessMm !== 'number') paper.thicknessMm = 0.06
           })
+      })
+    // v3：新增专家委员会方案批复表；旧数据没有方案单，按整册进度回填一份历史批复，
+    // 全册没动过的先按加固补，补不出的不回填（该册只读，留待委员会正式批复）。
+    this.version(DB_VERSION)
+      .stores({
+        books: 'id, title, era, level, collectionNo, updatedAt',
+        volumes: 'id, bookId, volumeNo, bindingType, state, updatedAt',
+        leaves: 'id, volumeId, leafNo, damageType, phValue, state, updatedAt',
+        papers: 'id, leafId, paperType, laidPattern, deltaE, updatedAt',
+        repairOrders: 'id, leafId, seq, name, operator, state, updatedAt',
+        bindings: 'id, volumeId, method, verdict, finishDate, updatedAt',
+        approvals: 'id, planNo, volumeId, level, status, decidedAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const [volumes, leaves, orders, existing] = await Promise.all([
+          tx.table<Volume>('volumes').toArray(),
+          tx.table<Leaf>('leaves').toArray(),
+          tx.table<RepairOrder>('repairOrders').toArray(),
+          tx.table<RepairApproval>('approvals').toArray()
+        ])
+        if (existing.length > 0) return
+        const leafByVolume = new Map<string, string[]>()
+        leaves.forEach((leaf) => {
+          const list = leafByVolume.get(leaf.volumeId) ?? []
+          list.push(leaf.id)
+          leafByVolume.set(leaf.volumeId, list)
+        })
+        const backfills: RepairApproval[] = []
+        const stamp = Date.now()
+        volumes.forEach((volume, index) => {
+          const leafIds = leafByVolume.get(volume.id) ?? []
+          const volumeOrders = orders.filter((order) => leafIds.includes(order.leafId))
+          const level: ApprovalLevel | null = classifyLevelByProgress(volumeOrders)
+          // 补不出：不回填，留待委员会正式批复（该册在修复室侧只读）
+          if (!level) return
+          const started = volumeOrders.filter((order) => order.state !== 'todo')
+          const decidedAt = started
+            .map((order) => order.date)
+            .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date))
+            .sort()
+            .pop()
+          backfills.push({
+            id: `approval_hist_${volume.id}`,
+            planNo: historicalPlanNo(volume.id),
+            volumeId: volume.id,
+            level,
+            status: 'approved',
+            opinion: '系统升级时按整册旧工序进度回填的历史批复',
+            approver: '',
+            decidedAt: decidedAt ?? new Date(stamp).toISOString().slice(0, 10),
+            historical: true,
+            createdAt: stamp + index,
+            updatedAt: stamp + index
+          })
+        })
+        if (backfills.length > 0) await tx.table<RepairApproval>('approvals').bulkAdd(backfills)
       })
   }
 }
@@ -230,9 +291,65 @@ export async function seedDatabase(): Promise<void> {
     { id: 'bind_0101', volumeId: 'vol_0101', method: '四眼线装', finishDate: '2026-03-10', verdict: 'rework', inspector: '程砚', createdAt: now - day * 2, updatedAt: now - day * 2 }
   ]
 
+  // 委员会侧批复：与修复室各记各的，只按册次号对账；vol_0102 演示升级回填的历史批复
+  const approvals: RepairApproval[] = [
+    {
+      id: 'approval_0101',
+      planNo: 'FA-2026-0017',
+      volumeId: 'vol_0101',
+      level: 'full',
+      status: 'approved',
+      opinion: '同意按全面修复处理，注意最小干预。',
+      approver: '顾延年',
+      decidedAt: '2026-02-28',
+      historical: false,
+      createdAt: now - day * 17,
+      updatedAt: now - day * 17
+    },
+    {
+      id: 'approval_0102',
+      planNo: historicalPlanNo('vol_0102'),
+      volumeId: 'vol_0102',
+      level: 'reinforce',
+      status: 'approved',
+      opinion: '系统升级时按整册旧工序进度回填的历史批复',
+      approver: '',
+      decidedAt: '2026-02-20',
+      historical: true,
+      createdAt: now - day * 17,
+      updatedAt: now - day * 17
+    },
+    {
+      id: 'approval_0201',
+      planNo: 'FA-2026-0009',
+      volumeId: 'vol_0201',
+      level: 'partial',
+      status: 'approved',
+      opinion: '局部修复，溜口补破即可，不得整叶托裱。',
+      approver: '顾延年',
+      decidedAt: '2026-02-24',
+      historical: false,
+      createdAt: now - day * 23,
+      updatedAt: now - day * 23
+    },
+    {
+      id: 'approval_0301',
+      planNo: 'FA-2026-0003',
+      volumeId: 'vol_0301',
+      level: 'full',
+      status: 'approved',
+      opinion: '元刻残本，全面修复并蝴蝶装复原。',
+      approver: '卫长青',
+      decidedAt: '2026-02-10',
+      historical: false,
+      createdAt: now - day * 42,
+      updatedAt: now - day * 42
+    }
+  ]
+
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.approvals],
     async () => {
       await db.books.bulkPut(books)
       await db.volumes.bulkPut(volumes)
@@ -240,6 +357,7 @@ export async function seedDatabase(): Promise<void> {
       await db.papers.bulkPut(papers)
       await db.repairOrders.bulkPut(repairOrders)
       await db.bindings.bulkPut(bindings)
+      await db.approvals.bulkPut(approvals)
     }
   )
 }
@@ -256,16 +374,19 @@ export interface RestoreSnapshot {
   papers: Paper[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
+  /** v3 起存在；旧版备份缺省时按空数组导入（再靠委员会补批复） */
+  approvals?: RepairApproval[]
 }
 
 export async function exportSnapshot(): Promise<RestoreSnapshot> {
-  const [books, volumes, leaves, papers, repairOrders, bindings] = await Promise.all([
+  const [books, volumes, leaves, papers, repairOrders, bindings, approvals] = await Promise.all([
     db.books.toArray(),
     db.volumes.toArray(),
     db.leaves.toArray(),
     db.papers.toArray(),
     db.repairOrders.toArray(),
-    db.bindings.toArray()
+    db.bindings.toArray(),
+    db.approvals.toArray()
   ])
   return {
     app: DB_NAME,
@@ -276,7 +397,8 @@ export async function exportSnapshot(): Promise<RestoreSnapshot> {
     leaves,
     papers,
     repairOrders,
-    bindings
+    bindings,
+    approvals
   }
 }
 
@@ -302,7 +424,7 @@ export function validateSnapshot(input: unknown): string {
 export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.approvals],
     async () => {
       await Promise.all([
         db.books.clear(),
@@ -310,7 +432,8 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
         db.leaves.clear(),
         db.papers.clear(),
         db.repairOrders.clear(),
-        db.bindings.clear()
+        db.bindings.clear(),
+        db.approvals.clear()
       ])
       await db.books.bulkPut(snapshot.books)
       await db.volumes.bulkPut(snapshot.volumes)
@@ -318,6 +441,10 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
       await db.papers.bulkPut(snapshot.papers)
       await db.repairOrders.bulkPut(snapshot.repairOrders)
       await db.bindings.bulkPut(snapshot.bindings)
+      // 旧版备份没有批复集合：导入后该侧为空，靠委员会重新批复（工序照旧）
+      if (Array.isArray(snapshot.approvals) && snapshot.approvals.length > 0) {
+        await db.approvals.bulkPut(snapshot.approvals)
+      }
     }
   )
 }
@@ -325,7 +452,7 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.approvals],
     async () => {
       await Promise.all([
         db.books.clear(),
@@ -333,7 +460,8 @@ export async function clearAllTables(): Promise<void> {
         db.leaves.clear(),
         db.papers.clear(),
         db.repairOrders.clear(),
-        db.bindings.clear()
+        db.bindings.clear(),
+        db.approvals.clear()
       ])
     }
   )
@@ -345,18 +473,19 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [books, volumes, leaves, papers, repairOrders, bindings] = await Promise.all([
+  const [books, volumes, leaves, papers, repairOrders, bindings, approvals] = await Promise.all([
     db.books.count(),
     db.volumes.count(),
     db.leaves.count(),
     db.papers.count(),
     db.repairOrders.count(),
-    db.bindings.count()
+    db.bindings.count(),
+    db.approvals.count()
   ])
-  return { books, volumes, leaves, papers, repairOrders, bindings }
+  return { books, volumes, leaves, papers, repairOrders, bindings, approvals }
 }
 
-/** 级联删除古籍 → 册次 → 书叶 → 补纸 / 工序 / 装订 */
+/** 级联删除古籍 → 册次 → 书叶 → 补纸 / 工序 / 装订 / 批复 */
 export async function removeBookCascade(bookId: string): Promise<void> {
   const volumeIds = (await db.volumes.where('bookId').equals(bookId).toArray()).map((row) => row.id)
   const leafIds = volumeIds.length
@@ -364,7 +493,7 @@ export async function removeBookCascade(bookId: string): Promise<void> {
     : []
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.approvals],
     async () => {
       if (leafIds.length > 0) {
         await db.papers.where('leafId').anyOf(leafIds).delete()
@@ -373,6 +502,7 @@ export async function removeBookCascade(bookId: string): Promise<void> {
       if (volumeIds.length > 0) {
         await db.leaves.where('volumeId').anyOf(volumeIds).delete()
         await db.bindings.where('volumeId').anyOf(volumeIds).delete()
+        await db.approvals.where('volumeId').anyOf(volumeIds).delete()
       }
       await db.volumes.where('bookId').equals(bookId).delete()
       await db.books.delete(bookId)
@@ -380,12 +510,12 @@ export async function removeBookCascade(bookId: string): Promise<void> {
   )
 }
 
-/** 级联删除册次 → 书叶 → 补纸 / 工序 / 装订 */
+/** 级联删除册次 → 书叶 → 补纸 / 工序 / 装订 / 批复 */
 export async function removeVolumeCascade(volumeId: string): Promise<void> {
   const leafIds = (await db.leaves.where('volumeId').equals(volumeId).toArray()).map((row) => row.id)
   await db.transaction(
     'rw',
-    [db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.approvals],
     async () => {
       if (leafIds.length > 0) {
         await db.papers.where('leafId').anyOf(leafIds).delete()
@@ -393,6 +523,7 @@ export async function removeVolumeCascade(volumeId: string): Promise<void> {
       }
       await db.leaves.where('volumeId').equals(volumeId).delete()
       await db.bindings.where('volumeId').equals(volumeId).delete()
+      await db.approvals.where('volumeId').equals(volumeId).delete()
       await db.volumes.delete(volumeId)
     }
   )

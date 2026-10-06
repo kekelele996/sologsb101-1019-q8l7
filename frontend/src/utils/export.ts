@@ -8,12 +8,15 @@ import type { Leaf } from '@/types/leaf'
 import type { Paper } from '@/types/paper'
 import type { RepairOrder } from '@/types/repairOrder'
 import type { Binding } from '@/types/binding'
+import type { RepairApproval } from '@/types/approval'
 import { BOOK_LEVEL_LABEL } from '@/types/book'
 import { BINDING_TYPE_LABEL, VOLUME_STATE_LABEL } from '@/types/volume'
 import { DAMAGE_TYPE_LABEL, LEAF_STATE_LABEL } from '@/types/leaf'
 import { PAPER_TYPE_LABEL, deltaELevel } from '@/types/paper'
 import { REPAIR_NAME_LABEL } from '@/types/repairOrder'
 import { BINDING_VERDICT_LABEL } from '@/types/binding'
+import { APPROVAL_LEVEL_LABEL, APPROVAL_STATUS_LABEL } from '@/types/approval'
+import { effectiveApproval } from './approval'
 import type { RestoreSnapshot } from './db'
 
 /** 触发浏览器下载 */
@@ -55,9 +58,10 @@ export interface ExportContext {
   papers: Paper[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
+  approvals: RepairApproval[]
 }
 
-/** 验收归档清单文本：按古籍 → 册次 → 书叶 → 工序展开 */
+/** 验收归档清单文本：按古籍 → 册次（含委员会批复）→ 书叶 → 工序展开 */
 export function buildArchiveReport(context: ExportContext): string {
   const lines: string[] = ['古籍修复验收归档清单', `生成时间：${new Date().toLocaleString('zh-CN')}`, '']
   if (context.books.length === 0) {
@@ -71,12 +75,31 @@ export function buildArchiveReport(context: ExportContext): string {
     volumes.forEach((volume) => {
       const leaves = context.leaves.filter((leaf) => leaf.volumeId === volume.id)
       const binding = context.bindings.find((item) => item.volumeId === volume.id)
+      const approvals = context.approvals.filter((item) => item.volumeId === volume.id)
+      const effective = effectiveApproval(approvals)
       const totalArea = Math.round(leaves.reduce((sum, leaf) => sum + leaf.damageAreaCm2, 0) * 10) / 10
       const averagePh =
         leaves.length === 0 ? 0 : Math.round((leaves.reduce((sum, leaf) => sum + leaf.phValue, 0) / leaves.length) * 100) / 100
       lines.push(
         `   第 ${volume.volumeNo} 册　${BINDING_TYPE_LABEL[volume.bindingType]}　${VOLUME_STATE_LABEL[volume.state]}　叶数 ${volume.leafCount}　破损 ${totalArea} cm²　平均 pH ${averagePh}`
       )
+      lines.push(
+        `      方案批复：${
+          effective
+            ? `${effective.planNo}　${APPROVAL_LEVEL_LABEL[effective.level]}　${effective.decidedAt}　${effective.approver || '批复人未填'}${
+                effective.historical ? '　（升级时历史回填）' : ''
+              }`
+            : '无有效批复（驳回 / 撤回或未批复，修复室只可重发方案、只读等候）'
+        }`
+      )
+      const closed = approvals.filter((item) => item.status !== 'approved')
+      if (closed.length > 0) {
+        lines.push(
+          `         另有 ${closed.length} 份驳回 / 撤回留痕：${closed
+            .map((item) => `${item.planNo}（${APPROVAL_STATUS_LABEL[item.status]}）`)
+            .join('、')}`
+        )
+      }
       lines.push(
         `      装订验收：${
           binding
@@ -109,6 +132,8 @@ export function exportLeafLedgerCsv(context: ExportContext): string {
   const header = [
     '书名',
     '册次',
+    '方案单号',
+    '批复级别',
     '叶号',
     '破损类型',
     '面积(cm²)',
@@ -131,6 +156,7 @@ export function exportLeafLedgerCsv(context: ExportContext): string {
       const leaves = context.leaves
         .filter((leaf) => leaf.volumeId === volume.id)
         .sort((a, b) => a.leafNo - b.leafNo)
+      const approval = effectiveApproval(context.approvals.filter((item) => item.volumeId === volume.id))
       leaves.forEach((leaf) => {
         const paper = context.papers.find((item) => item.leafId === leaf.id)
         const orders = context.repairOrders
@@ -142,6 +168,8 @@ export function exportLeafLedgerCsv(context: ExportContext): string {
           [
             book.title,
             `第 ${volume.volumeNo} 册`,
+            approval ? approval.planNo : '',
+            approval ? APPROVAL_LEVEL_LABEL[approval.level] : '无有效批复',
             leaf.leafNo,
             DAMAGE_TYPE_LABEL[leaf.damageType],
             leaf.damageAreaCm2,
