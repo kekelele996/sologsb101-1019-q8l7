@@ -5,8 +5,12 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { createId, db, readUiPrefs, writeUiPrefs } from '@/utils/db'
-import { createEmptyOrderDraft, type OrderState, type RepairOrder, type RepairOrderDraft } from '@/types/repairOrder'
+import { createEmptyOrderDraft, type OrderState, type RepairOrder, type RepairOrderDraft, type RepairName } from '@/types/repairOrder'
 import { useLeafStore } from './leafStore'
+import { useBookStore } from './bookStore'
+import { useCommitteeStore } from './committeeStore'
+import { gateRepairName } from '@/utils/approvalPolicy'
+import type { CommitteeApproval } from '@/types/committeeApproval'
 
 export const useRepairStore = defineStore('repair', () => {
   const orders = ref<RepairOrder[]>([])
@@ -46,12 +50,30 @@ export const useRepairStore = defineStore('repair', () => {
     return orders.value.filter((order) => order.leafId === leafId).sort((a, b) => a.seq - b.seq)
   }
 
+  function approvalsForLeaf(leafId: string): CommitteeApproval[] {
+    const leafStore = useLeafStore()
+    const bookStore = useBookStore()
+    const committeeStore = useCommitteeStore()
+    const leaf = leafStore.leaves.find((item) => item.id === leafId)
+    const volume = leaf ? bookStore.volumes.find((item) => item.id === leaf.volumeId) : undefined
+    const book = volume ? bookStore.books.find((item) => item.id === volume.bookId) : undefined
+    if (!volume || !book) return []
+    return committeeStore.approvalsForVolumeKey(book.collectionNo, volume.volumeNo)
+  }
+
+  function assertOrderAllowed(leafId: string, name: RepairName, alreadyDone = false): void {
+    if (alreadyDone) return
+    const gate = gateRepairName(approvalsForLeaf(leafId), name)
+    if (!gate.allowed) throw new Error(gate.reason)
+  }
+
   function nextSeq(leafId: string): number {
     const list = orders.value.filter((order) => order.leafId === leafId)
     return list.length === 0 ? 1 : Math.max(...list.map((order) => order.seq)) + 1
   }
 
   async function createOrder(draft: RepairOrderDraft): Promise<RepairOrder> {
+    assertOrderAllowed(draft.leafId, draft.name, draft.state === 'done')
     const now = Date.now()
     const row: RepairOrder = { ...draft, id: createId('order'), createdAt: now, updatedAt: now }
     await db.repairOrders.put(row)
@@ -59,18 +81,27 @@ export const useRepairStore = defineStore('repair', () => {
     return row
   }
 
-  /** 按叶生成标准工序序列（补破 → 托裱 → 溜口 → 裁齐 → 压平） */
+  /** 按叶生成标准工序序列；只生成当前批复档级允许的工序（补破 / 托裱 / 溜口 / 裁齐 / 压平） */
   async function generateSequence(leafId: string): Promise<number> {
     const existing = ordersOfLeaf(leafId)
-    const names: RepairOrderDraft['name'][] = ['mend', 'mount', 'corner', 'trim', 'press']
+    const standardNames: RepairName[] = ['mend', 'mount', 'corner', 'trim', 'press']
+    const allowedNames = standardNames.filter((name) => {
+      const gate = gateRepairName(approvalsForLeaf(leafId), name)
+      return gate.allowed
+    })
+    if (allowedNames.length === 0) {
+      throw new Error(gateRepairName(approvalsForLeaf(leafId), 'mend').reason)
+    }
+    const usedNames = new Set(existing.map((order) => order.name))
     let created = 0
-    for (let index = 0; index < names.length; index += 1) {
-      const seq = index + 1
-      if (existing.some((order) => order.seq === seq)) continue
+    let seq = existing.length === 0 ? 0 : Math.max(...existing.map((order) => order.seq))
+    for (const name of allowedNames) {
+      if (usedNames.has(name)) continue
+      seq += 1
       const draft = createEmptyOrderDraft(leafId, seq)
       await db.repairOrders.put({
         ...draft,
-        name: names[index] as RepairOrderDraft['name'],
+        name,
         material: '',
         id: createId('order'),
         createdAt: Date.now(),
@@ -83,12 +114,25 @@ export const useRepairStore = defineStore('repair', () => {
   }
 
   async function updateOrder(id: string, patch: Partial<RepairOrder>): Promise<void> {
+    const existing = orders.value.find((order) => order.id === id)
+    if (existing) {
+      const nextName = patch.name ?? existing.name
+      if (existing.state === 'done' && nextName !== existing.name) {
+        throw new Error('已完成工序不回退，也不能改成其他工序')
+      }
+      if (existing.state !== 'done') assertOrderAllowed(existing.leafId, nextName)
+    }
     await db.repairOrders.update(id, { ...patch, updatedAt: Date.now() } as never)
     await loadOrders()
   }
 
   async function removeOrder(id: string): Promise<void> {
     const target = orders.value.find((order) => order.id === id)
+    if (target) {
+      if (target.state === 'done') throw new Error('已完成工序不回退、不删除，将作为历史记录保留')
+      const gate = gateRepairName(approvalsForLeaf(target.leafId), target.name)
+      if (!gate.allowed) throw new Error(gate.reason)
+    }
     await db.repairOrders.delete(id)
     if (target) {
       const rest = orders.value
@@ -102,6 +146,10 @@ export const useRepairStore = defineStore('repair', () => {
 
   async function batchUpdate(ids: string[], patch: Partial<RepairOrder>): Promise<void> {
     if (ids.length === 0) return
+    const targets = orders.value.filter((order) => ids.includes(order.id))
+    targets.forEach((order) => {
+      assertOrderAllowed(order.leafId, patch.name ?? order.name, order.state === 'done')
+    })
     const now = Date.now()
     const rows = orders.value.filter((order) => ids.includes(order.id)).map((order) => ({ ...order, ...patch, updatedAt: now }))
     await db.repairOrders.bulkPut(rows)
@@ -131,6 +179,7 @@ export const useRepairStore = defineStore('repair', () => {
     const index = flow.indexOf(order.state)
     const next = index < 0 || index >= flow.length - 1 ? order.state : (flow[index + 1] as OrderState)
     if (next === order.state) return order.state
+    if (order.state !== 'done') assertOrderAllowed(order.leafId, order.name)
     await updateOrder(id, { state: next })
     if (next === 'done') {
       const leafStore = useLeafStore()

@@ -16,6 +16,7 @@ import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useCommitteeStore } from '@/stores/committeeStore'
 import {
   BOOK_LEVEL_COLOR,
   BOOK_LEVEL_LABEL,
@@ -37,11 +38,14 @@ import {
   type Volume,
   type VolumeDraft
 } from '@/types/volume'
+import { REPAIR_LEVEL_LABEL } from '@/types/repairPlan'
+import { APPROVAL_STATUS_LABEL } from '@/types/committeeApproval'
 
 const router = useRouter()
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const committeeStore = useCommitteeStore()
 const { statOf } = useLeafStats()
 const bindingTable = useIdbTable<Binding>((database) => database.bindings, { sortByUpdatedAt: false })
 
@@ -224,6 +228,19 @@ function bookStat(bookId: string): {
 function boundVolumes(bookId: string): number {
   const volumeIds = bookStore.volumesOfBook(bookId).map((volume) => volume.id)
   return bindingTable.rows.value.filter((binding) => volumeIds.includes(binding.volumeId)).length
+}
+
+function approvalSummary(bookId: string, volumeNo: number) {
+  const book = bookStore.bookById(bookId)
+  if (!book) return null
+  const active = committeeStore.activeApprovalForVolumeKey(book.collectionNo, volumeNo)
+  const latest = committeeStore.latestApprovalForVolumeKey(book.collectionNo, volumeNo)
+  const text = active?.decisionLevel
+    ? REPAIR_LEVEL_LABEL[active.decisionLevel]
+    : latest
+      ? `${APPROVAL_STATUS_LABEL[latest.status]} / 待重发`
+      : '待批复'
+  return { active, latest, text }
 }
 
 const totals = computed(() => ({
@@ -419,7 +436,8 @@ function bindingLabel(value: string): string {
         </el-table-column>
         <el-table-column label="破损 / 工序" min-width="140">
           <template #default="{ row }">
-            {{ statOf(row.id).recordCount }} 条 / {{ statOf(row.id).orderDoneCount }}·{{ statOf(row.id).orderCount }}
+            <div>{{ statOf(row.id).recordCount }} 条 / {{ statOf(row.id).orderDoneCount }}·{{ statOf(row.id).orderCount }}</div>
+            <div class="gb-muted">{{ approvalSummary(row.bookId, row.volumeNo)?.text ?? '待批复' }}</div>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="240">

@@ -8,12 +8,16 @@ import type { Leaf } from '@/types/leaf'
 import type { Paper } from '@/types/paper'
 import type { RepairOrder } from '@/types/repairOrder'
 import type { Binding } from '@/types/binding'
+import type { RepairPlan } from '@/types/repairPlan'
+import type { CommitteeApproval } from '@/types/committeeApproval'
 import { BOOK_LEVEL_LABEL } from '@/types/book'
 import { BINDING_TYPE_LABEL, VOLUME_STATE_LABEL } from '@/types/volume'
 import { DAMAGE_TYPE_LABEL, LEAF_STATE_LABEL } from '@/types/leaf'
 import { PAPER_TYPE_LABEL, deltaELevel } from '@/types/paper'
 import { REPAIR_NAME_LABEL } from '@/types/repairOrder'
 import { BINDING_VERDICT_LABEL } from '@/types/binding'
+import { REPAIR_LEVEL_LABEL } from '@/types/repairPlan'
+import { APPROVAL_STATUS_LABEL } from '@/types/committeeApproval'
 import type { RestoreSnapshot } from './db'
 
 /** 触发浏览器下载 */
@@ -55,6 +59,8 @@ export interface ExportContext {
   papers: Paper[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
+  repairPlans: RepairPlan[]
+  committeeApprovals: CommitteeApproval[]
 }
 
 /** 验收归档清单文本：按古籍 → 册次 → 书叶 → 工序展开 */
@@ -71,6 +77,12 @@ export function buildArchiveReport(context: ExportContext): string {
     volumes.forEach((volume) => {
       const leaves = context.leaves.filter((leaf) => leaf.volumeId === volume.id)
       const binding = context.bindings.find((item) => item.volumeId === volume.id)
+      const book = context.books.find((item) => item.id === volume.bookId)
+      const activeApproval = book
+        ? [...context.committeeApprovals]
+            .filter((item) => item.status === 'approved' && item.collectionNo === book.collectionNo && item.volumeNo === volume.volumeNo)
+            .sort((a, b) => b.decidedDate.localeCompare(a.decidedDate) || b.createdAt - a.createdAt)[0]
+        : undefined
       const totalArea = Math.round(leaves.reduce((sum, leaf) => sum + leaf.damageAreaCm2, 0) * 10) / 10
       const averagePh =
         leaves.length === 0 ? 0 : Math.round((leaves.reduce((sum, leaf) => sum + leaf.phValue, 0) / leaves.length) * 100) / 100
@@ -82,6 +94,13 @@ export function buildArchiveReport(context: ExportContext): string {
           binding
             ? `${binding.method}　${binding.finishDate}　${BINDING_VERDICT_LABEL[binding.verdict]}　验收人 ${binding.inspector || '未填写'}`
             : '尚未装订'
+        }`
+      )
+      lines.push(
+        `      生效批复：${
+          activeApproval?.decisionLevel
+            ? `${APPROVAL_STATUS_LABEL[activeApproval.status]}　${REPAIR_LEVEL_LABEL[activeApproval.decisionLevel]}　${activeApproval.approvalNo}　${activeApproval.decidedDate}`
+            : '尚无同意批复'
         }`
       )
       leaves.forEach((leaf) => {
@@ -114,6 +133,8 @@ export function exportLeafLedgerCsv(context: ExportContext): string {
     '面积(cm²)',
     'pH',
     '书叶状态',
+    '批复状态',
+    '批复级别',
     '补纸纸种',
     '帘纹',
     '厚度(mm)',
@@ -128,6 +149,11 @@ export function exportLeafLedgerCsv(context: ExportContext): string {
   context.books.forEach((book) => {
     const volumes = context.volumes.filter((volume) => volume.bookId === book.id)
     volumes.forEach((volume) => {
+      const approval = book
+        ? [...context.committeeApprovals]
+            .filter((item) => item.status === 'approved' && item.collectionNo === book.collectionNo && item.volumeNo === volume.volumeNo)
+            .sort((a, b) => b.decidedDate.localeCompare(a.decidedDate) || b.createdAt - a.createdAt)[0]
+        : undefined
       const leaves = context.leaves
         .filter((leaf) => leaf.volumeId === volume.id)
         .sort((a, b) => a.leafNo - b.leafNo)
@@ -147,6 +173,8 @@ export function exportLeafLedgerCsv(context: ExportContext): string {
             leaf.damageAreaCm2,
             leaf.phValue,
             LEAF_STATE_LABEL[leaf.state],
+            approval ? APPROVAL_STATUS_LABEL[approval.status] : '待批复',
+            approval?.decisionLevel ? REPAIR_LEVEL_LABEL[approval.decisionLevel] : '',
             paper ? PAPER_TYPE_LABEL[paper.paperType] : '未选配',
             paper ? paper.laidPattern : '',
             paper ? paper.thicknessMm : '',

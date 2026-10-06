@@ -28,6 +28,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '补纸选配与染色', icon: 'Brush' }
   },
   {
+    path: '/committee',
+    name: 'committee-review',
+    component: () => import('@/pages/CommitteeReview.vue'),
+    meta: { title: '专家委员会批复', icon: 'Stamp' }
+  },
+  {
     path: '/repairs',
     name: 'repair-workflow',
     component: () => import('@/pages/RepairWorkflow.vue'),
